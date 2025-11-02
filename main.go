@@ -848,6 +848,21 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 }
 
 
+// ListenTCP listens on the current default node's user-space netstack.
+func ListenTCP(port int) (net.Listener, error) {
+	if defaultNode == nil || defaultNode.Net == nil {
+		return nil, fmt.Errorf("ygg: default node not initialized")
+	}
+	return defaultNode.ListenTCP(port)
+}
+
+// DialTCP dials a peer over the current default node's user-space netstack.
+func DialTCP(peerIPv6 string, port int) (net.Conn, error) {
+	if defaultNode == nil || defaultNode.Net == nil {
+		return nil, fmt.Errorf("ygg: default node not initialized")
+	}
+	return defaultNode.DialTCP(peerIPv6, port)
+}
 
 // in0200 reports whether ip is in 0200::/7 (Yggdrasil space).
 func in0200(ip net.IP) bool {
