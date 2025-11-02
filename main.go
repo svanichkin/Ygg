@@ -497,13 +497,16 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	}
 	// L3 R/W link to Ygg core
 	rwc := ipv6rwc.NewReadWriteCloser(n.Core)
-	// Channel endpoint with small queue and MTU 1280
+	// Channel endpoint with larger queue and MTU 1280
 	const mtu = 1280
-	ep := channel.New(1024, uint32(mtu), "ygg-chan")
+	ep := channel.New(4096, uint32(mtu), "ygg-chan")
 	st := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
+	// Enlarge TCP buffers for more stable signaling streams.
+	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPReceiveBufferSizeRangeOption{Min: 4 << 10, Default: 256 << 10, Max: 4 << 20})
+	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPSendBufferSizeRangeOption{Min: 4 << 10, Default: 256 << 10, Max: 4 << 20})
 	nicID := tcpip.NICID(1)
 	if err := st.CreateNIC(nicID, ep); err != nil {
 		return nil, fmt.Errorf("create NIC: %w", err)
@@ -551,19 +554,19 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	go func() {
 		var txBytes uint64
 		defer log.Printf("[netstack] tx stopped, bytes=%d", txBytes)
-		idleLogged := false
 		for {
+			select {
+			case <-ns.stopCh:
+				log.Printf("[netstack] tx stopping")
+				return
+			default:
+			}
 			pkt := ep.Read()
 			if pkt == nil {
-				if !idleLogged {
-					log.Printf("[netstack] tx: link endpoint returned nil (not closing), will retry...")
-					idleLogged = true
-				}
-				time.Sleep(10 * time.Millisecond)
+				// No outgoing packet currently; brief idle sleep.
+				time.Sleep(2 * time.Millisecond)
 				continue
 			}
-			idleLogged = false
-
 			view := pkt.ToView()
 			b := view.AsSlice()
 			pkt.DecRef()
@@ -880,6 +883,25 @@ func DialTCP(peerIPv6 string, port int) (net.Conn, error) {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
 	return defaultNode.DialTCP(peerIPv6, port)
+}
+
+// ListenUDP listens on the current default node's user-space netstack and returns
+// a PacketConn bound to our Ygg IPv6 on the given port. Packets can be ReadFrom/WriteTo.
+func ListenUDP(port int) (net.PacketConn, error) {
+	if defaultNode == nil || defaultNode.Net == nil {
+		return nil, fmt.Errorf("ygg: default node not initialized")
+	}
+	return defaultNode.Net.ListenUDP(port)
+}
+
+// DialUDP dials a peer over the current default node's user-space netstack and returns
+// a connected PacketConn (Write/Read without specifying addr each time).
+func DialUDP(peerIPv6 string, port int) (net.PacketConn, error) {
+	if defaultNode == nil || defaultNode.Net == nil {
+		return nil, fmt.Errorf("ygg: default node not initialized")
+	}
+	pc, _, err := defaultNode.Net.DialUDP(peerIPv6, port, 10*time.Second)
+	return pc, err
 }
 
 // in0200 reports whether ip is in 0200::/7 (Yggdrasil space).
