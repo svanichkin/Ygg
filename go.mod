@@ -1,4 +1,4 @@
-module ygg
+module github.com/svanichkin/Ygg
 
 go 1.22
 
