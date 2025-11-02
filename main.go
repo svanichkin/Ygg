@@ -27,6 +27,8 @@ import (
 
 	ycfg "github.com/yggdrasil-network/yggdrasil-go/src/config"
 	ycore "github.com/yggdrasil-network/yggdrasil-go/src/core"
+	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
+	"github.com/yggdrasil-network/yggdrasil-go/src/tun"
 )
 
 const publicPeersURL = "https://publicpeers.neilalexander.dev/"
@@ -307,6 +309,7 @@ func uniqUnion(a, b []string) []string {
 type Node struct {
 	Core      *ycore.Core
 	Config    *ycfg.NodeConfig
+	Tun       *tun.TunAdapter
 	monCancel context.CancelFunc
 }
 
@@ -316,6 +319,11 @@ func (n *Node) Close() error {
 	if n != nil && n.monCancel != nil {
 		n.monCancel()
 		n.monCancel = nil
+	}
+	// stop TUN if present
+	if n != nil && n.Tun != nil {
+		_ = n.Tun.Stop()
+		n.Tun = nil
 	}
 	// try to stop the core gracefully if supported
 	type stopper interface{ Stop() }
@@ -434,19 +442,6 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 		}
 	}
 
-	// --- Ensure embedded TUN interface (utun/tun) is enabled so the app does not need a system daemon.
-	// IfName=="none" disables TUN in Yggdrasil. We want Ygg to create a virtual interface for us.
-	// "auto" lets Yggdrasil pick a platform-default name (e.g. utunX on macOS, tun0 on Linux/Windows).
-	if strings.TrimSpace(cfg.IfName) == "" || strings.EqualFold(cfg.IfName, "none") {
-		cfg.IfName = "auto"
-	}
-	// Set a sane MTU if not provided. Yggdrasil requires >=1280. We'll stick to 1280 by default
-	// to avoid fragmentation across diverse transports.
-	if cfg.IfMTU == 0 {
-		cfg.IfMTU = 1280
-	}
-	log.Printf("[ygg] TUN requested: IfName=%q MTU=%d (the process may require elevated privileges to create/configure the interface)", cfg.IfName, cfg.IfMTU)
-
 	return cfg, nil
 }
 
@@ -510,8 +505,18 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 	if err != nil {
 		return nil, err
 	}
-	// Hint in logs that we expect a TUN/utun interface to appear when the core starts handling IPv6
-	logV("core: TUN/utun will be created by Yggdrasil if supported (IfName=%s, MTU=%d)", cfg.IfName, cfg.IfMTU)
+	// Wire a TUN adapter to the core so the process owns its own utun/tun device
+	// This requires elevated privileges on most platforms (sudo/admin/root).
+	rwc := ipv6rwc.NewReadWriteCloser(core)
+	// Choose sensible defaults; the OS will pick concrete name (e.g. utunX on macOS)
+	tunMTU := tun.DefaultMTU()
+	t, terr := tun.New(rwc, logger, tun.InterfaceName(tun.DefaultName()), tun.InterfaceMTU(tunMTU))
+	if terr != nil {
+		return nil, fmt.Errorf("create TUN: %w", terr)
+	}
+	// Log interface info and our Ygg address/subnet
+	log.Printf("[ygg] TUN up: name=%s mtu=%d", t.Name(), t.MTU())
+	log.Printf("[ygg] address: %s subnet: %v", rwc.Address(), rwc.Subnet())
 	logV("core: adding peers=%d", len(peers))
 	// add peers to autodial table
 	added := 0
@@ -546,7 +551,7 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 			}
 			if ok {
 				logV("connect: first_up in %s", time.Since(t0).Truncate(time.Millisecond))
-				return &Node{Core: core, Config: cfg}, nil
+				return &Node{Core: core, Config: cfg, Tun: t}, nil
 			}
 			core.RetryPeersNow()
 		}
