@@ -56,6 +56,9 @@ var (
 	maxPeers int
 )
 
+// defaultNode is set by New() so top-level helpers (ListenTCP/DialTCP) can be used.
+var defaultNode *Node
+
 // ConnectivityHandler is called whenever the node transitions between
 // connected and disconnected states.
 type ConnectivityHandler func(connected bool)
@@ -223,6 +226,8 @@ func New(cfgPath string) (*Node, error) {
 	if connectivityHandler != nil {
 		node.startConnectivityMonitor(3 * time.Second)
 	}
+	// Expose as default for package-level helpers
+	defaultNode = node
 
 	return node, nil
 }
@@ -436,7 +441,11 @@ func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (n
 	if port <= 0 || port > 65535 {
 		return nil, tcpip.FullAddress{}, fmt.Errorf("invalid port %d", port)
 	}
-	ip := net.ParseIP(strings.TrimSpace(peerIPv6))
+	s := strings.TrimSpace(peerIPv6)
+	if len(s) > 0 && s[0] == '[' && s[len(s)-1] == ']' {
+		s = s[1 : len(s)-1]
+	}
+	ip := net.ParseIP(s)
 	if ip == nil || ip.To4() != nil {
 		return nil, tcpip.FullAddress{}, fmt.Errorf("invalid IPv6 address: %q", peerIPv6)
 	}
@@ -459,6 +468,22 @@ func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (n
 	}
 	log.Printf("[p2p] [ns] dial udp [%s]:%d", ip.String(), port)
 	return pc, rfa, nil
+}
+
+// ListenTCP exposes netstack-backed listener from the node.
+func (n *Node) ListenTCP(port int) (net.Listener, error) {
+	if n == nil || n.Net == nil {
+		return nil, fmt.Errorf("netstack not started")
+	}
+	return n.Net.ListenTCP(port)
+}
+
+// DialTCP dials peer via this node's netstack with a default timeout.
+func (n *Node) DialTCP(peerIPv6 string, port int) (net.Conn, error) {
+	if n == nil || n.Net == nil {
+		return nil, fmt.Errorf("netstack not started")
+	}
+	return n.Net.DialTCP(peerIPv6, port, 10*time.Second)
 }
 
 // newNetstack wires Ygg core to gVisor netstack via ipv6rwc/channel endpoint.
@@ -821,6 +846,8 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 		}
 	}
 }
+
+
 
 // in0200 reports whether ip is in 0200::/7 (Yggdrasil space).
 func in0200(ip net.IP) bool {
