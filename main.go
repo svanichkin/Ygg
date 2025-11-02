@@ -509,8 +509,12 @@ func (c *udpStreamConn) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		if c.raddr == nil {
+			// lazily bind to the first sender
+			c.raddr = addr
+		}
 		if c.raddr != nil && addr.String() != c.raddr.String() {
-			// ignore stray packet
+			// ignore stray packet from a different peer
 			continue
 		}
 		if n < 2 {
@@ -591,23 +595,8 @@ func (ns *Netstack) makeUDPStreamServer(port int) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	// learn remote on first packet
-	_ = pc.SetReadDeadline(time.Now().Add(10 * time.Second))
-	buf := make([]byte, 1500)
-	n, raddr, err := pc.ReadFrom(buf)
-	if err != nil {
-		pc.Close()
-		return nil, err
-	}
-	// push the first packet into buffer of the conn
-	c := &udpStreamConn{pc: pc, raddr: raddr}
-	if n >= 2 {
-		ln := int(buf[0])<<8 | int(buf[1])
-		if ln > 0 && 2+ln <= n {
-			c.rbuf.Write(buf[2 : 2+ln])
-		}
-	}
-	return c, nil
+	// Peer will be fixed on the first Read() by udpStreamConn.Read.
+	return &udpStreamConn{pc: pc}, nil
 }
 
 // makeUDPStreamClient dials a peer and returns a stream conn over UDP.
