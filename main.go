@@ -2,22 +2,16 @@ package ygg
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"crypto/ed25519"
@@ -27,8 +21,18 @@ import (
 
 	ycfg "github.com/yggdrasil-network/yggdrasil-go/src/config"
 	ycore "github.com/yggdrasil-network/yggdrasil-go/src/core"
-	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
-	"github.com/yggdrasil-network/yggdrasil-go/src/tun"
+	ipv6rwc "github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
+
+	// gVisor netstack
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
 const publicPeersURL = "https://publicpeers.neilalexander.dev/"
@@ -202,6 +206,10 @@ func New(cfgPath string) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Start in-process netstack immediately (single-mode runtime, no OS utun)
+	if _, err := node.StartNetstack(); err != nil {
+		return nil, fmt.Errorf("start netstack: %w", err)
+	}
 
 	addr := node.Core.Address()
 	keyHex := strings.TrimSpace(ac.Seed)
@@ -266,51 +274,354 @@ func LoadOrInitAppConfig(path string) (*AppConfig, error) {
 	return c, nil
 }
 
-func SaveJSON(path string, v any) error {
-	tmp := path + ".tmp"
-	b, _ := json.MarshalIndent(v, "", "  ")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// uniqUnion returns a union of a and b preserving the order of a, then appending unseen items from b.
-func uniqUnion(a, b []string) []string {
-	seen := make(map[string]struct{}, len(a)+len(b))
-	out := make([]string, 0, len(a)+len(b))
-	for _, s := range a {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	for _, s := range b {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	return out
-}
-
 // -------- Ygg cfg/keys --------
 
 type Node struct {
 	Core      *ycore.Core
 	Config    *ycfg.NodeConfig
-	Tun       *tun.TunAdapter
 	monCancel context.CancelFunc
+	Net       *Netstack
+}
+
+// Netstack wraps an in-process gVisor TCP/IP stack bridged to Yggdrasil core via ipv6rwc.
+type Netstack struct {
+	Stack   *stack.Stack
+	NICID   tcpip.NICID
+	addr    tcpip.Address
+	mtu     uint32
+	rwc     io.ReadWriteCloser
+	chEP    *channel.Endpoint
+	stopCh  chan struct{}
+	stopped bool
+}
+
+// AddrString returns our Ygg IPv6 as string
+func (ns *Netstack) AddrString() string {
+	if ns == nil {
+		return ""
+	}
+	return ns.addr.String()
+}
+
+// Addr returns our Ygg IPv6 as net.IP
+func (ns *Netstack) Addr() net.IP {
+	if ns == nil {
+		return nil
+	}
+	ip := net.ParseIP(ns.addr.String())
+	return ip
+}
+
+// Close stops pumps and releases resources.
+func (ns *Netstack) Close() error {
+	if ns == nil || ns.stopped {
+		return nil
+	}
+	ns.stopped = true
+	close(ns.stopCh)
+	if ns.chEP != nil {
+		ns.chEP.Close()
+		ns.chEP = nil
+	}
+	if ns.rwc != nil {
+		_ = ns.rwc.Close()
+		ns.rwc = nil
+	}
+	ns.Stack = nil
+	ns.NICID = 0
+	log.Printf("[netstack] closed")
+	return nil
+}
+
+// ListenTCP exposes a net.Listener-like API backed by netstack.
+func (ns *Netstack) ListenTCP(port int) (net.Listener, error) {
+	if ns == nil || ns.Stack == nil {
+		return nil, fmt.Errorf("netstack not started")
+	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %d", port)
+	}
+	log.Printf("[p2p] [ns] listen tcp [%s]:%d", ns.addr.String(), port)
+	fa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr, Port: uint16(port)}
+	ln, err := gonet.ListenTCP(ns.Stack, fa, ipv6.ProtocolNumber)
+	if err != nil {
+		return nil, err
+	}
+	return ln, nil
+}
+
+// DialTCP dials a remote Ygg IPv6 + port through the in-process stack.
+func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (net.Conn, error) {
+	if ns == nil || ns.Stack == nil {
+		return nil, fmt.Errorf("netstack not started")
+	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %d", port)
+	}
+	s := strings.TrimSpace(peerIPv6)
+	if len(s) > 0 && s[0] == '[' && s[len(s)-1] == ']' {
+		s = s[1 : len(s)-1]
+	}
+	ip := net.ParseIP(s)
+	if ip == nil || ip.To4() != nil {
+		return nil, fmt.Errorf("invalid IPv6 address: %q", peerIPv6)
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IPv6 address: %q", peerIPv6)
+	}
+	// Check 0200::/7 (first 7 bits are 0b0010 000)
+	if !in0200(ip) {
+		return nil, fmt.Errorf("address %q not in 0200::/7", peerIPv6)
+	}
+	log.Printf("[p2p] [ns] dial tcp [%s]:%d", ip.String(), port)
+	var p16 [16]byte
+	copy(p16[:], ip)
+	rfa := tcpip.FullAddress{NIC: ns.NICID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
+
+	// Apply optional timeout via context.
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	c, err := gonet.DialContextTCP(ctx, ns.Stack, rfa, ipv6.ProtocolNumber)
+	if err != nil {
+		return nil, err
+	}
+	if timeout > 0 {
+		_ = c.SetDeadline(time.Now().Add(timeout))
+	}
+	// Optional low-latency settings (if supported by gonet)
+	var ic interface{} = c
+	type noDelaySetter interface{ SetNoDelay(bool) error }
+	type kaSetter interface{
+		SetKeepAlive(bool) error
+		SetKeepAlivePeriod(time.Duration) error
+	}
+	if nd, ok := ic.(noDelaySetter); ok {
+		_ = nd.SetNoDelay(true)
+	}
+	if ka, ok := ic.(kaSetter); ok {
+		_ = ka.SetKeepAlive(true)
+		_ = ka.SetKeepAlivePeriod(30 * time.Second)
+	}
+	return c, nil
+}
+
+// ListenUDP exposes a net.PacketConn-like API backed by netstack for UDP.
+func (ns *Netstack) ListenUDP(port int) (net.PacketConn, error) {
+	if ns == nil || ns.Stack == nil {
+		return nil, fmt.Errorf("netstack not started")
+	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %d", port)
+	}
+	lfa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr, Port: uint16(port)}
+	pc, err := gonet.DialUDP(ns.Stack, &lfa, nil, ipv6.ProtocolNumber)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[p2p] [ns] listen udp [%s]:%d", ns.addr.String(), port)
+	return pc, nil
+}
+
+// DialUDP dials a remote Ygg IPv6 + port using UDP.
+func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (net.PacketConn, tcpip.FullAddress, error) {
+	if ns == nil || ns.Stack == nil {
+		return nil, tcpip.FullAddress{}, fmt.Errorf("netstack not started")
+	}
+	if port <= 0 || port > 65535 {
+		return nil, tcpip.FullAddress{}, fmt.Errorf("invalid port %d", port)
+	}
+	ip := net.ParseIP(strings.TrimSpace(peerIPv6))
+	if ip == nil || ip.To4() != nil {
+		return nil, tcpip.FullAddress{}, fmt.Errorf("invalid IPv6 address: %q", peerIPv6)
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return nil, tcpip.FullAddress{}, fmt.Errorf("invalid IPv6 address: %q", peerIPv6)
+	}
+	if !in0200(ip) {
+		return nil, tcpip.FullAddress{}, fmt.Errorf("address %q not in 0200::/7", peerIPv6)
+	}
+	var p16 [16]byte
+	copy(p16[:], ip)
+	rfa := tcpip.FullAddress{NIC: ns.NICID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
+
+	// Bind ephemeral local UDP on our NIC/address.
+	lfa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr}
+	pc, err := gonet.DialUDP(ns.Stack, &lfa, &rfa, ipv6.ProtocolNumber)
+	if err != nil {
+		return nil, tcpip.FullAddress{}, err
+	}
+	log.Printf("[p2p] [ns] dial udp [%s]:%d", ip.String(), port)
+	return pc, rfa, nil
+}
+
+// newNetstack wires Ygg core to gVisor netstack via ipv6rwc/channel endpoint.
+func (n *Node) StartNetstack() (*Netstack, error) {
+	if n == nil || n.Core == nil {
+		return nil, fmt.Errorf("ygg core not initialized")
+	}
+	// Guard: if already running and not stopped, return immediately
+	if n.Net != nil && !n.Net.stopped {
+		return n.Net, nil
+	}
+	// L3 R/W link to Ygg core
+	rwc := ipv6rwc.NewReadWriteCloser(n.Core)
+	// Channel endpoint with small queue and MTU 1280
+	const mtu = 1280
+	ep := channel.New(1024, uint32(mtu), "ygg-chan")
+	st := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+	})
+	nicID := tcpip.NICID(1)
+	if err := st.CreateNIC(nicID, ep); err != nil {
+		return nil, fmt.Errorf("create NIC: %w", err)
+	}
+	// Note: in this gVisor version, NIC is usable right after CreateNIC; no explicit SetNICUp.
+	// Install a default route for Ygg space 0200::/7 via this NIC (on-link)
+	var pfx200 [16]byte
+	pfx200[0] = 0x02 // 200::/7 anchor (top 7 bits)
+	addr200 := tcpip.AddrFrom16(pfx200)
+	sub200 := (tcpip.AddressWithPrefix{Address: addr200, PrefixLen: 7}).Subnet()
+	st.AddRoute(tcpip.Route{Destination: sub200, NIC: nicID})
+	// Our Ygg /128 address
+	ya := n.Core.Address() // net.IP
+	if ya == nil || ya.To16() == nil || ya.To4() != nil {
+		return nil, fmt.Errorf("bad ygg address")
+	}
+	y16 := ya.To16()
+	if y16 == nil {
+		return nil, fmt.Errorf("bad ygg v6 address")
+	}
+	var a16 [16]byte
+	copy(a16[:], y16)
+	yaddr := tcpip.AddrFrom16(a16)
+	if err := st.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol: ipv6.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   yaddr,
+			PrefixLen: 128,
+		},
+	}, stack.AddressProperties{}); err != nil {
+		return nil, fmt.Errorf("add addr: %w", err)
+	}
+	log.Printf("[netstack] nic=%d ready, route 200::/7 via nic", nicID)
+	log.Printf("[netstack] addr bound /128: %s", ya.String())
+	// Add on-link route for our /64 so local peers in the same prefix do not hit default
+	ap := tcpip.AddressWithPrefix{Address: yaddr, PrefixLen: 64}
+	st.AddRoute(tcpip.Route{Destination: ap.Subnet(), NIC: nicID})
+	ns := &Netstack{Stack: st, NICID: nicID, addr: yaddr, mtu: mtu, rwc: rwc, chEP: ep, stopCh: make(chan struct{})}
+	n.Net = ns
+	// TX pump: packets from netstack -> ygg core
+	go func() {
+		for {
+			pkt := ep.Read()
+			if pkt == nil {
+				return
+			}
+			view := pkt.ToView()
+			b := view.AsSlice()
+			pkt.DecRef()
+			if len(b) == 0 {
+				continue
+			}
+			offset := 0
+			for offset < len(b) {
+				n, err := rwc.Write(b[offset:])
+				if err != nil {
+					if strings.Contains(err.Error(), "closed") || err == io.EOF {
+						return
+					}
+					log.Printf("[netstack] tx write error: %v", err)
+					break
+				}
+				if n <= 0 {
+					// avoid busy loop
+					time.Sleep(1 * time.Millisecond)
+					continue
+				}
+				offset += n
+			}
+		}
+	}()
+	// RX pump: frames from ygg core -> netstack
+	go func() {
+		buf := make([]byte, mtu)
+		for {
+			select {
+			case <-ns.stopCh:
+				return
+			default:
+			}
+			nread, err := rwc.Read(buf)
+			if err != nil {
+				if err == io.EOF || err == io.ErrClosedPipe || strings.Contains(err.Error(), "closed") {
+					return
+				}
+				log.Printf("[netstack] rx read error: %v", err)
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if nread <= 0 {
+				continue
+			}
+			payload := make([]byte, nread)
+			copy(payload, buf[:nread])
+			pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(payload)})
+			ep.InjectInbound(header.IPv6ProtocolNumber, pb)
+			pb.DecRef()
+		}
+	}()
+	log.Printf("[netstack] up: addr=%s mtu=%d", ya.String(), mtu)
+	return ns, nil
+}
+
+// ErrNotConnected is returned when an operation requires an active Ygg link
+// (at least one Up peer), but the node currently has none.
+var ErrNotConnected = errors.New("ygg: not connected")
+
+// Connected reports whether the node currently has at least one Up peer.
+func (n *Node) Connected() bool {
+	if n == nil || n.Core == nil {
+		return false
+	}
+	return hasUp(n.Core)
+}
+
+// WaitConnected blocks until the node has at least one Up peer or the context
+// is cancelled. The check runs at the given interval; if interval <= 0, 500ms
+// is used. Returns nil when connected, ctx.Err() on cancellation/timeout.
+func (n *Node) WaitConnected(ctx context.Context, interval time.Duration) error {
+	if n == nil || n.Core == nil {
+		return ErrNotConnected
+	}
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	// Fast path: already connected
+	if hasUp(n.Core) {
+		return nil
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			if hasUp(n.Core) {
+				return nil
+			}
+			// Nudge the core to retry peers faster while we wait
+			n.Core.RetryPeersNow()
+		}
+	}
 }
 
 // Close attempts to gracefully stop the underlying core, if supported.
@@ -320,10 +631,10 @@ func (n *Node) Close() error {
 		n.monCancel()
 		n.monCancel = nil
 	}
-	// stop TUN if present
-	if n != nil && n.Tun != nil {
-		_ = n.Tun.Stop()
-		n.Tun = nil
+	// stop in-process netstack if running
+	if n != nil && n.Net != nil {
+		_ = n.Net.Close()
+		n.Net = nil
 	}
 	// try to stop the core gracefully if supported
 	type stopper interface{ Stop() }
@@ -370,24 +681,6 @@ func (n *Node) startConnectivityMonitor(interval time.Duration) {
 }
 
 // generate or load keys into ycfg.NodeConfig
-
-// hasUp reports whether the core has at least one Up peer.
-func hasUp(core *ycore.Core) bool {
-	for _, p := range core.GetPeers() {
-		if p.Up {
-			return true
-		}
-	}
-	return false
-}
-
-// notifyConnectivity invokes the connectivity handler if set.
-func notifyConnectivity(connected bool) {
-	if h := connectivityHandler; h != nil {
-		h(connected)
-	}
-}
-
 func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 	cfg := ycfg.GenerateConfig() // sane defaults; will be overridden below
 
@@ -445,25 +738,6 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 	return cfg, nil
 }
 
-// certFromPrivateKey creates a self-signed TLS cert using the provided ed25519 private key.
-func certFromPrivateKey(priv ed25519.PrivateKey) (*tls.Certificate, error) {
-	tpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(3650 * 24 * time.Hour), // ~10 years
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-	pub := priv.Public().(ed25519.PublicKey)
-	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, pub, priv)
-	if err != nil {
-		return nil, err
-	}
-	cert := &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
-	return cert, nil
-}
-
 // start Core and connect to peers until first connection is up
 func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) (*Node, error) {
 	t0 := time.Now()
@@ -501,22 +775,12 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 		}
 	}
 
+	// Note: we do not request OS TUN here. The process will run in user-space mode
+	// and expose L3 via ipv6rwc to an in-process netstack (configured elsewhere).
 	core, err := ycore.New(cert, logger, opts...)
 	if err != nil {
 		return nil, err
 	}
-	// Wire a TUN adapter to the core so the process owns its own utun/tun device
-	// This requires elevated privileges on most platforms (sudo/admin/root).
-	rwc := ipv6rwc.NewReadWriteCloser(core)
-	// Choose sensible defaults; the OS will pick concrete name (e.g. utunX on macOS)
-	tunMTU := tun.DefaultMTU()
-	t, terr := tun.New(rwc, logger, tun.InterfaceName(tun.DefaultName()), tun.InterfaceMTU(tunMTU))
-	if terr != nil {
-		return nil, fmt.Errorf("create TUN: %w", terr)
-	}
-	// Log interface info and our Ygg address/subnet
-	log.Printf("[ygg] TUN up: name=%s mtu=%d", t.Name(), t.MTU())
-	log.Printf("[ygg] address: %s subnet: %v", rwc.Address(), rwc.Subnet())
 	logV("core: adding peers=%d", len(peers))
 	// add peers to autodial table
 	added := 0
@@ -551,178 +815,20 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 			}
 			if ok {
 				logV("connect: first_up in %s", time.Since(t0).Truncate(time.Millisecond))
-				return &Node{Core: core, Config: cfg, Tun: t}, nil
+				return &Node{Core: core, Config: cfg}, nil
 			}
 			core.RetryPeersNow()
 		}
 	}
 }
 
-// FilterAlivePeers checks peer availability and returns only those considered "alive".
-// For http/https — perform HTTP GET with InsecureTLS; for other schemes — TCP dial to host:port.
-func FilterAlivePeers(peers []string, timeout time.Duration, maxParallel int) []string {
-	if maxParallel <= 0 {
-		maxParallel = 16
-	}
-	type result struct {
-		idx int
-		ok  bool
-	}
-
-	alive := make([]string, 0, len(peers))
-	ch := make(chan result, len(peers))
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
-
-	for i, raw := range peers {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(idx int, p string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			ok := probePeer(p, timeout)
-			ch <- result{idx: idx, ok: ok}
-		}(i, raw)
-	}
-
-	wg.Wait()
-	close(ch)
-
-	for res := range ch {
-		if res.ok {
-			alive = append(alive, strings.TrimSpace(peers[res.idx]))
-		}
-	}
-	return alive
-}
-
-func probePeer(raw string, timeout time.Duration) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
+// in0200 reports whether ip is in 0200::/7 (Yggdrasil space).
+func in0200(ip net.IP) bool {
+	b := ip.To16()
+	if b == nil {
 		return false
 	}
-
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		// Any successful HTTP response (any status) counts as alive.
-		tr := &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // insecure, like curl -k
-			},
-			DialContext: (&net.Dialer{Timeout: timeout}).DialContext,
-		}
-		cl := &http.Client{Transport: tr, Timeout: timeout}
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, raw, nil)
-		resp, err := cl.Do(req)
-		if err != nil {
-			return false
-		}
-		resp.Body.Close()
-		return true
-
-	default:
-		// For other schemes, try TCP to host:port if present.
-		hostport := u.Host
-		if hostport == "" && u.Opaque != "" {
-			// support for forms like "scheme:host:port" without //
-			hostport = u.Opaque
-		}
-		if hostport == "" {
-			return false
-		}
-		d := net.Dialer{Timeout: timeout}
-		c, err := d.Dial("tcp", hostport)
-		if err != nil {
-			return false
-		}
-		_ = c.Close()
-		return true
-	}
-}
-
-func fetchPeersFromURL(timeout time.Duration) ([]string, error) {
-	cl := &http.Client{Timeout: timeout}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, publicPeersURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "say/0.1")
-	resp, err := cl.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s", resp.Status)
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	re := regexp.MustCompile(`(tcp|tls|quic|ws|wss)://[^<\s]+`)
-	matches := re.FindAllString(string(b), -1)
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("no peers found on page")
-	}
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(matches))
-	for _, m := range matches {
-		m = strings.TrimSpace(m)
-		if m == "" {
-			continue
-		}
-		if _, ok := seen[m]; ok {
-			continue
-		}
-		seen[m] = struct{}{}
-		out = append(out, m)
-	}
-	return out, nil
-}
-
-func CollectPeers(static []string, timeout time.Duration, maxParallel int) ([]string, error) {
-	var all []string
-	all = append(all, static...)
-	fromURL, err := fetchPeersFromURL(timeout)
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		return nil, err
-	}
-	all = append(all, fromURL...)
-	// dedupe and basic sanitize
-	seen := map[string]struct{}{}
-	uniq := make([]string, 0, len(all))
-	for _, p := range all {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		// only accept schemes we know how to probe
-		u, err := url.Parse(p)
-		if err != nil {
-			continue
-		}
-		sc := strings.ToLower(u.Scheme)
-		if sc != "http" && sc != "https" && sc != "tcp" && sc != "tls" && sc != "quic" && sc != "ws" && sc != "wss" {
-			continue
-		}
-		seen[p] = struct{}{}
-		uniq = append(uniq, p)
-	}
-	if len(uniq) == 0 {
-		return nil, fmt.Errorf("no peers provided")
-	}
-	alive := FilterAlivePeers(uniq, timeout, maxParallel)
-	if len(alive) == 0 {
-		return nil, fmt.Errorf("no alive peers")
-	}
-	return alive, nil
+	// 0200::/7 means the top 7 bits equal 0b0010 000.
+	// Accept 0x20xx (0010 0000) and 0x30xx (0011 0000) as commonly used by Yggdrasil.
+	return b[0]&0xFE == 0x02
 }
