@@ -1,7 +1,6 @@
 package ygg
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"crypto/ed25519"
@@ -472,161 +470,6 @@ func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (n
 	return pc, rfa, nil
 }
 
-// ---------------- UDP stream shim (net.Conn over UDP) ----------------
-// udpStreamConn wraps a PacketConn into a stream-like net.Conn using length-delimited frames.
-// Each Write() becomes a single datagram prefixed with a 2-byte length (big-endian).
-// Read() reconstructs the stream from received datagrams.
-
-type udpStreamConn struct {
-	pc    net.PacketConn
-	raddr net.Addr
-
-	rdMu sync.Mutex
-	wrMu sync.Mutex
-
-	// read side buffer
-	rbuf bytes.Buffer
-
-	// deadlines
-	rdDL time.Time
-	wrDL time.Time
-
-	closed bool
-
-	onClose func()
-	closePC bool
-}
-
-func (c *udpStreamConn) Read(p []byte) (int, error) {
-	if c == nil || c.pc == nil {
-		return 0, io.EOF
-	}
-	for {
-		if c.closed {
-			return 0, io.EOF
-		}
-		if c.rbuf.Len() > 0 {
-			return c.rbuf.Read(p)
-		}
-		// read one datagram
-		_ = c.pc.SetReadDeadline(c.rdDL)
-		buf := make([]byte, 1500)
-		n, addr, err := c.pc.ReadFrom(buf)
-		if err != nil {
-			return 0, err
-		}
-		if c.raddr == nil {
-			// lazily bind to the first sender
-			c.raddr = addr
-		}
-		if c.raddr != nil && addr.String() != c.raddr.String() {
-			// ignore stray packet from a different peer
-			continue
-		}
-		if n < 2 {
-			continue
-		}
-		// first 2 bytes len
-		ln := int(buf[0])<<8 | int(buf[1])
-		if ln <= 0 || 2+ln > n {
-			continue
-		}
-		c.rbuf.Write(buf[2 : 2+ln])
-	}
-}
-
-func (c *udpStreamConn) Write(p []byte) (int, error) {
-	if c.closed {
-		return 0, io.ErrClosedPipe
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if len(p) > 1400 {
-		// split into chunks to fit MTU with header
-		total := 0
-		for off := 0; off < len(p); {
-			end := off + 1400
-			if end > len(p) {
-				end = len(p)
-			}
-			n, err := c.Write(p[off:end])
-			total += n
-			if err != nil {
-				return total, err
-			}
-			off = end
-		}
-		return total, nil
-	}
-	// frame = 2-byte len prefix + payload
-	frame := make([]byte, 2+len(p))
-	frame[0] = byte(len(p) >> 8)
-	frame[1] = byte(len(p))
-	copy(frame[2:], p)
-	_ = c.pc.SetWriteDeadline(c.wrDL)
-	_, err := c.pc.WriteTo(frame, c.raddr)
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (c *udpStreamConn) Close() error {
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	if c.onClose != nil {
-		c.onClose()
-	}
-	if c.closePC {
-		return c.pc.Close()
-	}
-	return nil
-}
-
-func (c *udpStreamConn) LocalAddr() net.Addr  { return c.pc.LocalAddr() }
-func (c *udpStreamConn) RemoteAddr() net.Addr { return c.raddr }
-func (c *udpStreamConn) SetDeadline(t time.Time) error {
-	c.rdDL, c.wrDL = t, t
-	return nil
-}
-func (c *udpStreamConn) SetReadDeadline(t time.Time) error {
-	c.rdDL = t
-	return nil
-}
-func (c *udpStreamConn) SetWriteDeadline(t time.Time) error {
-	c.wrDL = t
-	return nil
-}
-
-// makeUDPStreamServer waits for the first datagram to learn peer and returns a stream conn.
-func (ns *Netstack) makeUDPStreamServer(port int) (net.Conn, error) {
-	pc, err := ns.ListenUDP(port)
-	if err != nil {
-		return nil, err
-	}
-	// Peer will be fixed on the first Read() by udpStreamConn.Read.
-	return &udpStreamConn{pc: pc}, nil
-}
-
-// makeUDPStreamClient dials a peer and returns a stream conn over UDP.
-func (ns *Netstack) makeUDPStreamClient(peerIPv6 string, port int, timeout time.Duration) (net.Conn, error) {
-	pc, _, err := ns.DialUDP(peerIPv6, port, timeout)
-	if err != nil {
-		return nil, err
-	}
-	// Build remote UDPAddr from the validated peerIPv6 and port.
-	s := strings.TrimSpace(peerIPv6)
-	if len(s) > 0 && s[0] == '[' && s[len(s)-1] == ']' {
-		s = s[1 : len(s)-1]
-	}
-	rip := net.ParseIP(s)
-	raddr := &net.UDPAddr{IP: rip, Port: port}
-	return &udpStreamConn{pc: pc, raddr: raddr, closePC: true}, nil
-}
-
 // ListenTCP exposes netstack-backed listener from the node.
 func (n *Node) ListenTCP(port int) (net.Listener, error) {
 	if n == nil || n.Net == nil {
@@ -1026,106 +869,20 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 	}
 }
 
-// ListenTCP now provides a stream-like connection over UDP under the hood
-// to avoid TCP head-of-line blocking for voice. It returns a net.Listener
-// that Accept()s one conn per caller. Subsequent Accept() calls will block
-// until a new peer sends the first datagram.
-type udpStreamListener struct {
-	ns         *Netstack
-	port       int
-	pc         net.PacketConn
-	connActive bool
-	released   chan struct{}
-}
-
-func (l *udpStreamListener) Accept() (net.Conn, error) {
-	if l.pc == nil {
-		return nil, fmt.Errorf("udp-stream listener closed")
-	}
-	// If a previous connection is active, wait until it's released.
-	if l.connActive {
-		if l.released == nil {
-			l.released = make(chan struct{}, 1)
-		}
-		<-l.released
-	}
-
-	// Learn peer: read the very first datagram here and prime the conn buffer.
-	// This guarantees conn.RemoteAddr() is known and the server's first Read won't time out.
-	// Temporary deadline so Accept doesn't block forever if we're shutting down.
-	_ = l.pc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 1500)
-	n, raddr, err := l.pc.ReadFrom(buf)
-	// Clear deadline regardless of outcome
-	_ = l.pc.SetReadDeadline(time.Time{})
-	if err != nil {
-		// Unblock future Accept calls
-		if l.released != nil {
-			select { case l.released <- struct{}{}: default: }
-		}
-		return nil, err
-	}
-
-	l.connActive = true
-	c := &udpStreamConn{pc: l.pc, raddr: raddr, onClose: func() {
-		l.connActive = false
-		if l.released != nil {
-			select { case l.released <- struct{}{}: default: }
-		}
-	}}
-
-	// Prime internal stream buffer with the first frame (length-prefixed) if well-formed.
-	if n >= 2 {
-		ln := int(buf[0])<<8 | int(buf[1])
-		if ln > 0 && 2+ln <= n {
-			c.rbuf.Write(buf[2 : 2+ln])
-		}
-	}
-	return c, nil
-}
-
-func (l *udpStreamListener) Close() error {
-	if l.pc != nil {
-		_ = l.pc.Close()
-		l.pc = nil
-	}
-	if l.released != nil {
-		select {
-		case l.released <- struct{}{}:
-		default:
-		}
-	}
-	return nil
-}
-
-func (l *udpStreamListener) Addr() net.Addr {
-	if l.pc != nil {
-		return l.pc.LocalAddr()
-	}
-	return &net.TCPAddr{IP: l.ns.Addr(), Port: l.port}
-}
-
+// ListenTCP listens on the current default node's user-space netstack.
 func ListenTCP(port int) (net.Listener, error) {
 	if defaultNode == nil || defaultNode.Net == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
-	pc, err := defaultNode.Net.ListenUDP(port)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[p2p] [ns] listen (udp-stream) [%s]:%d", defaultNode.Net.addr.String(), port)
-	lst := &udpStreamListener{ns: defaultNode.Net, port: port, pc: pc, released: make(chan struct{}, 1)}
-	// allow first Accept immediately
-	lst.released <- struct{}{}
-	return lst, nil
+	return defaultNode.ListenTCP(port)
 }
 
+// DialTCP dials a peer over the current default node's user-space netstack.
 func DialTCP(peerIPv6 string, port int) (net.Conn, error) {
 	if defaultNode == nil || defaultNode.Net == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
-	log.Printf("[p2p] [ns] dial (udp-stream) [%s]:%d", strings.Trim(peerIPv6, "[]"), port)
-	return defaultNode.Net.makeUDPStreamClient(peerIPv6, port, 10*time.Second)
+	return defaultNode.DialTCP(peerIPv6, port)
 }
 
 // ListenUDP listens on the current default node's user-space netstack and returns
