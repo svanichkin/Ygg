@@ -402,7 +402,7 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 	// Optional low-latency settings (if supported by gonet)
 	var ic interface{} = c
 	type noDelaySetter interface{ SetNoDelay(bool) error }
-	type kaSetter interface{
+	type kaSetter interface {
 		SetKeepAlive(bool) error
 		SetKeepAlivePeriod(time.Duration) error
 	}
@@ -509,12 +509,6 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 		return nil, fmt.Errorf("create NIC: %w", err)
 	}
 	// Note: in this gVisor version, NIC is usable right after CreateNIC; no explicit SetNICUp.
-	// Install a default route for Ygg space 0200::/7 via this NIC (on-link)
-	var pfx200 [16]byte
-	pfx200[0] = 0x02 // 200::/7 anchor (top 7 bits)
-	addr200 := tcpip.AddrFrom16(pfx200)
-	sub200 := (tcpip.AddressWithPrefix{Address: addr200, PrefixLen: 7}).Subnet()
-	st.AddRoute(tcpip.Route{Destination: sub200, NIC: nicID})
 	// Our Ygg /128 address
 	ya := n.Core.Address() // net.IP
 	if ya == nil || ya.To16() == nil || ya.To4() != nil {
@@ -538,45 +532,69 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	}
 	log.Printf("[netstack] nic=%d ready, route 200::/7 via nic", nicID)
 	log.Printf("[netstack] addr bound /128: %s", ya.String())
-	// Add on-link route for our /64 so local peers in the same prefix do not hit default
+	// Default ::/0 via this NIC so all IPv6 traffic (incl. Ygg) has a path.
+	st.AddRoute(tcpip.Route{Destination: header.IPv6Any.WithPrefix().Subnet(), NIC: nicID})
+
+	// Our /64 on-link to prefer local-prefix peers.
 	ap := tcpip.AddressWithPrefix{Address: yaddr, PrefixLen: 64}
 	st.AddRoute(tcpip.Route{Destination: ap.Subnet(), NIC: nicID})
+
+	// Explicit Ygg 200::/7 (optional but documents intent).
+	var pfx200 [16]byte
+	pfx200[0] = 0x02
+	addr200 := tcpip.AddrFrom16(pfx200)
+	sub200 := (tcpip.AddressWithPrefix{Address: addr200, PrefixLen: 7}).Subnet()
+	st.AddRoute(tcpip.Route{Destination: sub200, NIC: nicID})
 	ns := &Netstack{Stack: st, NICID: nicID, addr: yaddr, mtu: mtu, rwc: rwc, chEP: ep, stopCh: make(chan struct{})}
 	n.Net = ns
 	// TX pump: packets from netstack -> ygg core
 	go func() {
+		var txBytes uint64
+		defer log.Printf("[netstack] tx stopped, bytes=%d", txBytes)
+		idleLogged := false
 		for {
 			pkt := ep.Read()
 			if pkt == nil {
-				return
+				if !idleLogged {
+					log.Printf("[netstack] tx: link endpoint returned nil (not closing), will retry...")
+					idleLogged = true
+				}
+				time.Sleep(10 * time.Millisecond)
+				continue
 			}
+			idleLogged = false
+
 			view := pkt.ToView()
 			b := view.AsSlice()
 			pkt.DecRef()
 			if len(b) == 0 {
 				continue
 			}
-			offset := 0
-			for offset < len(b) {
-				n, err := rwc.Write(b[offset:])
+			off := 0
+			for off < len(b) {
+				n, err := rwc.Write(b[off:])
 				if err != nil {
 					if strings.Contains(err.Error(), "closed") || err == io.EOF {
+						log.Printf("[netstack] tx: write closed: %v", err)
 						return
 					}
-					log.Printf("[netstack] tx write error: %v", err)
-					break
+					log.Printf("[netstack] tx write error (will retry): %v", err)
+					time.Sleep(5 * time.Millisecond)
+					continue
 				}
 				if n <= 0 {
-					// avoid busy loop
 					time.Sleep(1 * time.Millisecond)
 					continue
 				}
-				offset += n
+				off += n
+				txBytes += uint64(n)
 			}
 		}
 	}()
 	// RX pump: frames from ygg core -> netstack
 	go func() {
+		var rxBytes uint64
+		defer log.Printf("[netstack] rx stopped, bytes=%d", rxBytes)
 		buf := make([]byte, mtu)
 		for {
 			select {
@@ -596,6 +614,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 			if nread <= 0 {
 				continue
 			}
+			rxBytes += uint64(nread)
 			payload := make([]byte, nread)
 			copy(payload, buf[:nread])
 			pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(payload)})
@@ -846,7 +865,6 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 		}
 	}
 }
-
 
 // ListenTCP listens on the current default node's user-space netstack.
 func ListenTCP(port int) (net.Listener, error) {
