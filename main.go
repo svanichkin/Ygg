@@ -1019,22 +1019,45 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 // that Accept()s one conn per caller. Subsequent Accept() calls will block
 // until a new peer sends the first datagram.
 type udpStreamListener struct {
-	ns   *Netstack
-	port int
+	ns       *Netstack
+	port     int
+	pc       net.PacketConn
+	accepted bool
 }
 
 func (l *udpStreamListener) Accept() (net.Conn, error) {
-	return l.ns.makeUDPStreamServer(l.port)
+	if l.accepted {
+		return nil, fmt.Errorf("udp-stream listener: already accepted one connection on port %d", l.port)
+	}
+	l.accepted = true
+	// Peer will be fixed on first Read() inside udpStreamConn.
+	return &udpStreamConn{pc: l.pc}, nil
 }
-func (l *udpStreamListener) Close() error { return nil }
-func (l *udpStreamListener) Addr() net.Addr { return &net.TCPAddr{IP: l.ns.Addr(), Port: l.port} }
+
+func (l *udpStreamListener) Close() error {
+	if l.pc != nil {
+		return l.pc.Close()
+	}
+	return nil
+}
+
+func (l *udpStreamListener) Addr() net.Addr {
+	if l.pc != nil {
+		return l.pc.LocalAddr()
+	}
+	return &net.TCPAddr{IP: l.ns.Addr(), Port: l.port}
+}
 
 func ListenTCP(port int) (net.Listener, error) {
 	if defaultNode == nil || defaultNode.Net == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
+	pc, err := defaultNode.Net.ListenUDP(port)
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("[p2p] [ns] listen (udp-stream) [%s]:%d", defaultNode.Net.addr.String(), port)
-	return &udpStreamListener{ns: defaultNode.Net, port: port}, nil
+	return &udpStreamListener{ns: defaultNode.Net, port: port, pc: pc}, nil
 }
 
 func DialTCP(peerIPv6 string, port int) (net.Conn, error) {
