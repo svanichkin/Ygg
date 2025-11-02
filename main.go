@@ -208,7 +208,6 @@ func New(cfgPath string) (*Node, error) {
 	} else {
 		log.Printf("connected: %s", addr.String())
 	}
-	log.Printf("subnet (/64): %s", node.Core.Subnet())
 
 	// Start connectivity monitor if user installed a handler.
 	if connectivityHandler != nil {
@@ -435,6 +434,19 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 		}
 	}
 
+	// --- Ensure embedded TUN interface (utun/tun) is enabled so the app does not need a system daemon.
+	// IfName=="none" disables TUN in Yggdrasil. We want Ygg to create a virtual interface for us.
+	// "auto" lets Yggdrasil pick a platform-default name (e.g. utunX on macOS, tun0 on Linux/Windows).
+	if strings.TrimSpace(cfg.IfName) == "" || strings.EqualFold(cfg.IfName, "none") {
+		cfg.IfName = "auto"
+	}
+	// Set a sane MTU if not provided. Yggdrasil requires >=1280. We'll stick to 1280 by default
+	// to avoid fragmentation across diverse transports.
+	if cfg.IfMTU == 0 {
+		cfg.IfMTU = 1280
+	}
+	log.Printf("[ygg] TUN requested: IfName=%q MTU=%d (the process may require elevated privileges to create/configure the interface)", cfg.IfName, cfg.IfMTU)
+
 	return cfg, nil
 }
 
@@ -498,6 +510,8 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 	if err != nil {
 		return nil, err
 	}
+	// Hint in logs that we expect a TUN/utun interface to appear when the core starts handling IPv6
+	logV("core: TUN/utun will be created by Yggdrasil if supported (IfName=%s, MTU=%d)", cfg.IfName, cfg.IfMTU)
 	logV("core: adding peers=%d", len(peers))
 	// add peers to autodial table
 	added := 0
