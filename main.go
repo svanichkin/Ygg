@@ -481,8 +481,8 @@ type udpStreamConn struct {
 	pc    net.PacketConn
 	raddr net.Addr
 
-	rdMu  sync.Mutex
-	wrMu  sync.Mutex
+	rdMu sync.Mutex
+	wrMu sync.Mutex
 
 	// read side buffer
 	rbuf bytes.Buffer
@@ -492,6 +492,9 @@ type udpStreamConn struct {
 	wrDL time.Time
 
 	closed bool
+
+	onClose func()
+	closePC bool
 }
 
 func (c *udpStreamConn) Read(p []byte) (int, error) {
@@ -571,7 +574,13 @@ func (c *udpStreamConn) Close() error {
 		return nil
 	}
 	c.closed = true
-	return c.pc.Close()
+	if c.onClose != nil {
+		c.onClose()
+	}
+	if c.closePC {
+		return c.pc.Close()
+	}
+	return nil
 }
 
 func (c *udpStreamConn) LocalAddr() net.Addr  { return c.pc.LocalAddr() }
@@ -612,7 +621,7 @@ func (ns *Netstack) makeUDPStreamClient(peerIPv6 string, port int, timeout time.
 	}
 	rip := net.ParseIP(s)
 	raddr := &net.UDPAddr{IP: rip, Port: port}
-	return &udpStreamConn{pc: pc, raddr: raddr}, nil
+	return &udpStreamConn{pc: pc, raddr: raddr, closePC: true}, nil
 }
 
 // ListenTCP exposes netstack-backed listener from the node.
@@ -1019,24 +1028,48 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 // that Accept()s one conn per caller. Subsequent Accept() calls will block
 // until a new peer sends the first datagram.
 type udpStreamListener struct {
-	ns       *Netstack
-	port     int
-	pc       net.PacketConn
-	accepted bool
+	ns         *Netstack
+	port       int
+	pc         net.PacketConn
+	connActive bool
+	released   chan struct{}
 }
 
 func (l *udpStreamListener) Accept() (net.Conn, error) {
-	if l.accepted {
-		return nil, fmt.Errorf("udp-stream listener: already accepted one connection on port %d", l.port)
+	if l.pc == nil {
+		return nil, fmt.Errorf("udp-stream listener closed")
 	}
-	l.accepted = true
-	// Peer will be fixed on first Read() inside udpStreamConn.
-	return &udpStreamConn{pc: l.pc}, nil
+	// If a previous connection is active, wait until it's released.
+	if l.connActive {
+		if l.released == nil {
+			l.released = make(chan struct{}, 1)
+		}
+		<-l.released
+	}
+	l.connActive = true
+	// Return a stream wrapper over the shared PacketConn. Do not close pc on conn.Close().
+	c := &udpStreamConn{pc: l.pc, onClose: func() {
+		l.connActive = false
+		if l.released != nil {
+			select {
+			case l.released <- struct{}{}:
+			default:
+			}
+		}
+	}}
+	return c, nil
 }
 
 func (l *udpStreamListener) Close() error {
 	if l.pc != nil {
-		return l.pc.Close()
+		_ = l.pc.Close()
+		l.pc = nil
+	}
+	if l.released != nil {
+		select {
+		case l.released <- struct{}{}:
+		default:
+		}
 	}
 	return nil
 }
@@ -1057,7 +1090,10 @@ func ListenTCP(port int) (net.Listener, error) {
 		return nil, err
 	}
 	log.Printf("[p2p] [ns] listen (udp-stream) [%s]:%d", defaultNode.Net.addr.String(), port)
-	return &udpStreamListener{ns: defaultNode.Net, port: port, pc: pc}, nil
+	lst := &udpStreamListener{ns: defaultNode.Net, port: port, pc: pc, released: make(chan struct{}, 1)}
+	// allow first Accept immediately
+	lst.released <- struct{}{}
+	return lst, nil
 }
 
 func DialTCP(peerIPv6 string, port int) (net.Conn, error) {
