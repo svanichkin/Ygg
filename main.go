@@ -498,6 +498,9 @@ type udpStreamConn struct {
 }
 
 func (c *udpStreamConn) Read(p []byte) (int, error) {
+	if c == nil || c.pc == nil {
+		return 0, io.EOF
+	}
 	for {
 		if c.closed {
 			return 0, io.EOF
@@ -1046,17 +1049,38 @@ func (l *udpStreamListener) Accept() (net.Conn, error) {
 		}
 		<-l.released
 	}
+
+	// Learn peer: read the very first datagram here and prime the conn buffer.
+	// This guarantees conn.RemoteAddr() is known and the server's first Read won't time out.
+	// Temporary deadline so Accept doesn't block forever if we're shutting down.
+	_ = l.pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1500)
+	n, raddr, err := l.pc.ReadFrom(buf)
+	// Clear deadline regardless of outcome
+	_ = l.pc.SetReadDeadline(time.Time{})
+	if err != nil {
+		// Unblock future Accept calls
+		if l.released != nil {
+			select { case l.released <- struct{}{}: default: }
+		}
+		return nil, err
+	}
+
 	l.connActive = true
-	// Return a stream wrapper over the shared PacketConn. Do not close pc on conn.Close().
-	c := &udpStreamConn{pc: l.pc, onClose: func() {
+	c := &udpStreamConn{pc: l.pc, raddr: raddr, onClose: func() {
 		l.connActive = false
 		if l.released != nil {
-			select {
-			case l.released <- struct{}{}:
-			default:
-			}
+			select { case l.released <- struct{}{}: default: }
 		}
 	}}
+
+	// Prime internal stream buffer with the first frame (length-prefixed) if well-formed.
+	if n >= 2 {
+		ln := int(buf[0])<<8 | int(buf[1])
+		if ln > 0 && 2+ln <= n {
+			c.rbuf.Write(buf[2 : 2+ln])
+		}
+	}
 	return c, nil
 }
 
