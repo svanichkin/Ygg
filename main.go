@@ -396,9 +396,6 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 	if err != nil {
 		return nil, err
 	}
-	if timeout > 0 {
-		_ = c.SetDeadline(time.Now().Add(timeout))
-	}
 	// Optional low-latency settings (if supported by gonet)
 	var ic interface{} = c
 	type noDelaySetter interface{ SetNoDelay(bool) error }
