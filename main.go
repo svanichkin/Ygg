@@ -115,7 +115,7 @@ func New(cfgPath string) (*Node, error) {
 		}
 	}
 
-	log.Println("config path:", cfgPath)
+	logV("config path:", cfgPath)
 
 	ac, err := LoadOrInitAppConfig(cfgPath)
 	if err != nil {
@@ -128,7 +128,7 @@ func New(cfgPath string) (*Node, error) {
 	if e := SaveJSON(cfgPath, ac); e != nil {
 		log.Printf("warn: can't write config: %v", e)
 	} else {
-		log.Println("config saved (keys inline)")
+		logV("config saved (keys inline)")
 	}
 
 	startPeers := time.Now()
@@ -416,7 +416,7 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 	return c, nil
 }
 
-// ListenUDP exposes a net.PacketConn-like API backed by netstack for UDP.
+// ListenUDP returns an unconnected UDP PacketConn bound to our Ygg IPv6. In gonet, DialUDP with raddr=nil yields an unconnected socket that supports ReadFrom/WriteTo.
 func (ns *Netstack) ListenUDP(port int) (net.PacketConn, error) {
 	if ns == nil || ns.Stack == nil {
 		return nil, fmt.Errorf("netstack not started")
@@ -424,6 +424,8 @@ func (ns *Netstack) ListenUDP(port int) (net.PacketConn, error) {
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", port)
 	}
+	// Bind a UDP endpoint without a remote; gonet.DialUDP(lfa, nil) returns
+	// an unconnected PacketConn that supports ReadFrom/WriteTo.
 	lfa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr, Port: uint16(port)}
 	pc, err := gonet.DialUDP(ns.Stack, &lfa, nil, ipv6.ProtocolNumber)
 	if err != nil {
@@ -770,9 +772,9 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 		cfg.PrivateKey = ycfg.KeyBytes(genPriv)
 		// store only the 32-byte seed to keep config compact
 		app.Seed = base64.RawURLEncoding.EncodeToString([]byte(cfg.PrivateKey)[:32])
-		log.Println("generated new private key (saved to config.json)")
+		logV("generated new private key (saved to config.json)")
 	} else {
-		log.Println("using private key from config.json")
+		logV("using private key from config.json")
 	}
 
 	// 4) Ensure TLS certificate exists for the core
