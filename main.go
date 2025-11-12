@@ -115,7 +115,7 @@ func New(cfgPath string) (*Node, error) {
 		}
 	}
 
-	logV("config path:", cfgPath)
+	logV("config path: %s", cfgPath)
 
 	ac, err := LoadOrInitAppConfig(cfgPath)
 	if err != nil {
@@ -126,7 +126,7 @@ func New(cfgPath string) (*Node, error) {
 		return nil, err
 	}
 	if e := SaveJSON(cfgPath, ac); e != nil {
-		log.Printf("warn: can't write config: %v", e)
+		logV("warn: can't write config: %v", e)
 	} else {
 		logV("config saved (keys inline)")
 	}
@@ -144,7 +144,7 @@ func New(cfgPath string) (*Node, error) {
 			if fromURL, err := fetchPeersFromURL(2 * time.Second); err == nil {
 				ac.Peers = uniqUnion(ac.Peers, fromURL)
 				if e := SaveJSON(cfgPath, ac); e != nil {
-					log.Printf("warn: can't save peers to config: %v", e)
+					logV("warn: can't save peers to config: %v", e)
 				}
 				alive = FilterAlivePeers(ac.Peers, 2*time.Second, 16)
 				logV("peers: alive_after_merge=%d", len(alive))
@@ -157,7 +157,7 @@ func New(cfgPath string) (*Node, error) {
 		go func() {
 			fromURL, err := fetchPeersFromURL(5 * time.Second)
 			if err != nil {
-				log.Printf("peers refresh: fetch failed: %v", err)
+				logV("peers refresh: fetch failed: %v", err)
 				return
 			}
 			before := len(ac.Peers)
@@ -165,20 +165,20 @@ func New(cfgPath string) (*Node, error) {
 			added := len(ac.Peers) - before
 			if added > 0 {
 				if e := SaveJSON(cfgPath, ac); e != nil {
-					log.Printf("warn: can't save peers to config: %v", e)
+					logV("warn: can't save peers to config: %v", e)
 				}
 			}
 			freshAlive := FilterAlivePeers(fromURL, 2*time.Second, 16)
-			log.Printf("peers updated: %d total (added=%d, alive_new=%d)", len(ac.Peers), added, len(freshAlive))
+			logV("peers updated: %d total (added=%d, alive_new=%d)", len(ac.Peers), added, len(freshAlive))
 		}()
 	} else {
-		log.Println("fetching peers from", publicPeersURL)
+		logV("fetching peers from %s", publicPeersURL)
 		// No peers in config: block until we fetch fresh peers (retry with backoff)
 		backoff := 2 * time.Second
 		for {
 			fromURL, err := fetchPeersFromURL(2 * time.Second)
 			if err != nil {
-				log.Printf("peers: fetch failed: %v; retrying in %s", err, backoff)
+				logV("peers: fetch failed: %v; retrying in %s", err, backoff)
 				time.Sleep(backoff)
 				if backoff < 30*time.Second {
 					backoff *= 2
@@ -188,7 +188,7 @@ func New(cfgPath string) (*Node, error) {
 			alive = FilterAlivePeers(fromURL, 2*time.Second, 16)
 			logV("peers: fetched=%d alive=%d (cold start)", len(fromURL), len(alive))
 			if len(alive) == 0 {
-				log.Printf("peers: fetched but none alive; retrying in %s", backoff)
+				logV("peers: fetched but none alive; retrying in %s", backoff)
 				time.Sleep(backoff)
 				if backoff < 30*time.Second {
 					backoff *= 2
@@ -197,7 +197,7 @@ func New(cfgPath string) (*Node, error) {
 			}
 			ac.Peers = uniqUnion(ac.Peers, fromURL)
 			if e := SaveJSON(cfgPath, ac); e != nil {
-				log.Printf("warn: can't save peers to config: %v", e)
+				logV("warn: can't save peers to config: %v", e)
 			}
 			break
 		}
@@ -217,9 +217,9 @@ func New(cfgPath string) (*Node, error) {
 	addr := node.Core.Address()
 	keyHex := strings.TrimSpace(ac.Seed)
 	if len(keyHex) >= 8 {
-		log.Printf("connected: %s (key fp=%s…)", addr.String(), keyHex[:8])
+		logV("connected: %s (key fp=%s…)", addr.String(), keyHex[:8])
 	} else {
-		log.Printf("connected: %s", addr.String())
+		logV("connected: %s", addr.String())
 	}
 
 	// Start connectivity monitor if user installed a handler.
@@ -334,7 +334,7 @@ func (ns *Netstack) Close() error {
 	}
 	ns.Stack = nil
 	ns.NICID = 0
-	log.Printf("[netstack] closed")
+	logV("[netstack] closed")
 	return nil
 }
 
@@ -346,7 +346,7 @@ func (ns *Netstack) ListenTCP(port int) (net.Listener, error) {
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", port)
 	}
-	log.Printf("[p2p] [ns] listen tcp [%s]:%d", ns.addr.String(), port)
+	logV("[p2p] [ns] listen tcp [%s]:%d", ns.addr.String(), port)
 	fa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr, Port: uint16(port)}
 	ln, err := gonet.ListenTCP(ns.Stack, fa, ipv6.ProtocolNumber)
 	if err != nil {
@@ -379,7 +379,7 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 	if !in0200(ip) {
 		return nil, fmt.Errorf("address %q not in 0200::/7", peerIPv6)
 	}
-	log.Printf("[p2p] [ns] dial tcp [%s]:%d", ip.String(), port)
+	logV("[p2p] [ns] dial tcp [%s]:%d", ip.String(), port)
 	var p16 [16]byte
 	copy(p16[:], ip)
 	rfa := tcpip.FullAddress{NIC: ns.NICID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
@@ -431,7 +431,7 @@ func (ns *Netstack) ListenUDP(port int) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[p2p] [ns] listen udp [%s]:%d", ns.addr.String(), port)
+	logV("[p2p] [ns] listen udp [%s]:%d", ns.addr.String(), port)
 	return pc, nil
 }
 
@@ -468,7 +468,7 @@ func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (n
 	if err != nil {
 		return nil, tcpip.FullAddress{}, err
 	}
-	log.Printf("[p2p] [ns] dial udp [%s]:%d", ip.String(), port)
+	logV("[p2p] [ns] dial udp [%s]:%d", ip.String(), port)
 	return pc, rfa, nil
 }
 
@@ -535,8 +535,8 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	}, stack.AddressProperties{}); err != nil {
 		return nil, fmt.Errorf("add addr: %w", err)
 	}
-	log.Printf("[netstack] nic=%d ready, route 200::/7 via nic", nicID)
-	log.Printf("[netstack] addr bound /128: %s", ya.String())
+	logV("[netstack] nic=%d ready, route 200::/7 via nic", nicID)
+	logV("[netstack] addr bound /128: %s", ya.String())
 	// Default ::/0 via this NIC so all IPv6 traffic (incl. Ygg) has a path.
 	st.AddRoute(tcpip.Route{Destination: header.IPv6Any.WithPrefix().Subnet(), NIC: nicID})
 
@@ -555,11 +555,11 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	// TX pump: packets from netstack -> ygg core
 	go func() {
 		var txBytes uint64
-		defer log.Printf("[netstack] tx stopped, bytes=%d", txBytes)
+		defer logV("[netstack] tx stopped, bytes=%d", txBytes)
 		for {
 			select {
 			case <-ns.stopCh:
-				log.Printf("[netstack] tx stopping")
+				logV("[netstack] tx stopping")
 				return
 			default:
 			}
@@ -583,7 +583,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 						log.Printf("[netstack] tx: write closed: %v", err)
 						return
 					}
-					log.Printf("[netstack] tx write error (will retry): %v", err)
+					logV("[netstack] tx write error (will retry): %v", err)
 					time.Sleep(5 * time.Millisecond)
 					continue
 				}
@@ -599,7 +599,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	// RX pump: frames from ygg core -> netstack
 	go func() {
 		var rxBytes uint64
-		defer log.Printf("[netstack] rx stopped, bytes=%d", rxBytes)
+		defer logV("[netstack] rx stopped, bytes=%d", rxBytes)
 		buf := make([]byte, mtu)
 		for {
 			select {
@@ -612,7 +612,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 				if err == io.EOF || err == io.ErrClosedPipe || strings.Contains(err.Error(), "closed") {
 					return
 				}
-				log.Printf("[netstack] rx read error: %v", err)
+				logV("[netstack] rx read error: %v", err)
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
@@ -627,7 +627,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 			pb.DecRef()
 		}
 	}()
-	log.Printf("[netstack] up: addr=%s mtu=%d", ya.String(), mtu)
+	logV("[netstack] up: addr=%s mtu=%d", ya.String(), mtu)
 	return ns, nil
 }
 
