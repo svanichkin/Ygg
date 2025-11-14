@@ -73,6 +73,7 @@ var supportedPeerSchemes = map[string]struct{}{
 	"wss":   {},
 }
 
+// fetchPeersFromURL downloads the JSON peer list and returns usable endpoints.
 func fetchPeersFromURL(timeout time.Duration) ([]string, error) {
 	ctx := context.Background()
 	if timeout > 0 {
@@ -244,7 +245,7 @@ func CollectPeers(static []string, timeout time.Duration, maxParallel int) ([]st
 		return nil, err
 	}
 	all = append(all, fromURL...)
-	// dedupe and basic sanitize
+	// Dedupe and basic sanitize.
 	seen := map[string]struct{}{}
 	uniq := make([]string, 0, len(all))
 	for _, p := range all {
@@ -255,7 +256,7 @@ func CollectPeers(static []string, timeout time.Duration, maxParallel int) ([]st
 		if _, ok := seen[p]; ok {
 			continue
 		}
-		// only accept schemes we know how to probe
+		// Only accept schemes we know how to probe.
 		if !isSupportedPeerScheme(p) {
 			continue
 		}
