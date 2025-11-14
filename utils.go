@@ -9,13 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -61,9 +59,30 @@ func uniqUnion(a, b []string) []string {
 	return out
 }
 
+type publicPeerEntry struct {
+	Up *bool `json:"up"`
+}
+
+var supportedPeerSchemes = map[string]struct{}{
+	"http":  {},
+	"https": {},
+	"tcp":   {},
+	"tls":   {},
+	"quic":  {},
+	"ws":    {},
+	"wss":   {},
+}
+
 func fetchPeersFromURL(timeout time.Duration) ([]string, error) {
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	cl := &http.Client{Timeout: timeout}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, publicPeersURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicPeersURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -76,33 +95,61 @@ func fetchPeersFromURL(timeout time.Duration) ([]string, error) {
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("%s", resp.Status)
 	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode peers: %w", err)
 	}
-	re := regexp.MustCompile(`(tcp|tls|quic|ws|wss)://[^<\s]+`)
-	matches := re.FindAllString(string(b), -1)
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("no peers found on page")
-	}
+
 	seen := map[string]struct{}{}
-	out := make([]string, 0, len(matches))
-	for _, m := range matches {
-		m = strings.TrimSpace(m)
-		if m == "" {
-			continue
+	out := make([]string, 0, len(raw))
+
+	for _, blob := range raw {
+		var nodes map[string]publicPeerEntry
+		if err := json.Unmarshal(blob, &nodes); err != nil {
+			continue // skip metadata blocks
 		}
-		if _, ok := seen[m]; ok {
-			continue
+		for endpoint, meta := range nodes {
+			endpoint = strings.TrimSpace(endpoint)
+			if endpoint == "" {
+				continue
+			}
+			if meta.Up != nil && !*meta.Up {
+				continue
+			}
+			if _, ok := seen[endpoint]; ok {
+				continue
+			}
+			if !isSupportedPeerScheme(endpoint) {
+				continue
+			}
+			seen[endpoint] = struct{}{}
+			out = append(out, endpoint)
 		}
-		seen[m] = struct{}{}
-		out = append(out, m)
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no peers found in %s", publicPeersURL)
 	}
 	return out, nil
 }
 
+func isSupportedPeerScheme(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if _, ok := supportedPeerSchemes[strings.ToLower(u.Scheme)]; !ok {
+		return false
+	}
+	return true
+}
+
 // FilterAlivePeers checks peer availability and returns only those considered "alive".
-// For http/https — perform HTTP GET with InsecureTLS; for other schemes — TCP dial to host:port.
+// For http/https - perform HTTP GET with InsecureTLS; for other schemes - TCP dial to host:port.
 func FilterAlivePeers(peers []string, timeout time.Duration, maxParallel int) []string {
 	if maxParallel <= 0 {
 		maxParallel = 16
@@ -209,12 +256,7 @@ func CollectPeers(static []string, timeout time.Duration, maxParallel int) ([]st
 			continue
 		}
 		// only accept schemes we know how to probe
-		u, err := url.Parse(p)
-		if err != nil {
-			continue
-		}
-		sc := strings.ToLower(u.Scheme)
-		if sc != "http" && sc != "https" && sc != "tcp" && sc != "tls" && sc != "quic" && sc != "ws" && sc != "wss" {
+		if !isSupportedPeerScheme(p) {
 			continue
 		}
 		seen[p] = struct{}{}

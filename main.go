@@ -35,7 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
-const publicPeersURL = "https://publicpeers.neilalexander.dev/"
+const publicPeersURL = "https://publicpeers.neilalexander.dev/publicnodes.json"
 
 type quietLogger struct{}
 
@@ -217,7 +217,7 @@ func New(cfgPath string) (*Node, error) {
 	addr := node.Core.Address()
 	keyHex := strings.TrimSpace(ac.Seed)
 	if len(keyHex) >= 8 {
-		logV("connected: %s (key fp=%s…)", addr.String(), keyHex[:8])
+		logV("connected: %s (key fp=%s...)", addr.String(), keyHex[:8])
 	} else {
 		logV("connected: %s", addr.String())
 	}
@@ -760,7 +760,7 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 		loadedExisting = true
 	}
 
-	// 3) If no key was loaded — generate a new one
+	// 3) If no key was loaded - generate a new one
 	if !loadedExisting {
 		_, genPriv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
