@@ -503,7 +503,9 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-	// Enlarge TCP buffers for more stable signaling streams.
+	// Enlarge transport buffers to better absorb bursts.
+	_ = st.SetOption(tcpip.ReceiveBufferSizeOption{Min: 4 << 10, Default: 512 << 10, Max: 4 << 20})
+	_ = st.SetOption(tcpip.SendBufferSizeOption{Min: 4 << 10, Default: 512 << 10, Max: 4 << 20})
 	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPReceiveBufferSizeRangeOption{Min: 4 << 10, Default: 256 << 10, Max: 4 << 20})
 	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPSendBufferSizeRangeOption{Min: 4 << 10, Default: 256 << 10, Max: 4 << 20})
 	nicID := tcpip.NICID(1)
